@@ -23,9 +23,6 @@ struct arena {
 	char content[];
 };
 
-static struct arena *
-head_arena;
-
 /* Present at head and foot of every allocation */
 struct chunk_word {
 	unsigned long size:62;
@@ -49,8 +46,43 @@ struct chunk_footer {
 	struct chunk_word h;
 };
 
-void *
-malloc(size_t s)
+struct alloc_key {
+	unsigned long rip;
+};
+
+struct allocation_site {
+	struct allocation_site *next;
+	struct alloc_key key;
+	struct arena *head_arena;
+};
+
+static struct allocation_site
+internal_allocation;
+
+#define NR_AS_HASH_HEADS 4096
+static struct allocation_site *
+as_hash_heads[NR_AS_HASH_HEADS];
+
+static unsigned
+hash_alloc_key(const struct alloc_key *key)
+{
+	unsigned hash = 0;
+	unsigned long rip = key->rip;
+	while (rip) {
+		hash ^= rip % NR_AS_HASH_HEADS;
+		rip /= NR_AS_HASH_HEADS;
+	}
+	return hash;
+}
+
+static int
+alloc_keys_eq(const struct alloc_key *k1, const struct alloc_key *k2)
+{
+	return k1->rip == k2->rip;
+}
+
+static void *
+_malloc(struct allocation_site *as, size_t s)
 {
 	struct arena *a;
 	struct chunk_header *head, *next_head;
@@ -68,7 +100,7 @@ malloc(size_t s)
 	}
 	dbg("malloc2(%zd)\n", s);
 top:
-	for (a = head_arena; a; a = a->next) {
+	for (a = as->head_arena; a; a = a->next) {
 		dbg("arena %p\n", a);
 		for (offset = 0; offset != a->size; offset += head->h.size) {
 			head = (struct chunk_header *)(a->content + offset);
@@ -120,7 +152,7 @@ top:
 	if (a == MAP_FAILED)
 		return NULL;
 	a->prev = NULL;
-	a->next = head_arena;
+	a->next = as->head_arena;
 	a->size = arena_size - sizeof(struct arena);
 	head = (struct chunk_header *)a->content;
 	head->h.free = 1;
@@ -129,17 +161,59 @@ top:
 	footer = (struct chunk_footer *)((unsigned long)head + head->h.size) - 1;
 	footer->h = head->h;
 	footer->red = FOOTER_REDZONE;
-	if (head_arena)
-		head_arena->prev = a;
-	head_arena = a;
+	if (as->head_arena)
+		as->head_arena->prev = a;
+	as->head_arena = a;
 	dbg("new arena %p\n", a);
 	goto top;
+}
+
+#define get_alloc_key(as)						\
+	do {								\
+		(as)->rip = (unsigned long)__builtin_return_address(0);	\
+	} while (0)
+#define get_alloc_site()			\
+	({					\
+		struct alloc_key key;		\
+		get_alloc_key(&key);		\
+		find_allocation_site(&key);	\
+	})
+
+static struct allocation_site *
+find_allocation_site(const struct alloc_key *k)
+{
+	struct allocation_site **pas, *as;
+	unsigned h = hash_alloc_key(k);
+	pas = &as_hash_heads[h];
+	as = *pas;
+	while (as) {
+		if (alloc_keys_eq(&as->key, k))
+			break;
+		pas = &as->next;
+		as = *pas;
+	}
+	if (as) {
+		*pas = as->next;
+	} else {
+		as = _malloc(&internal_allocation, sizeof(*as));
+		as->head_arena = NULL;
+		as->key = *k;
+	}
+	as->next = as_hash_heads[h];
+	as_hash_heads[h] = as;
+	return as;
+}
+
+void *
+malloc(size_t s)
+{
+	return _malloc(get_alloc_site(), s);
 }
 
 void *
 calloc(size_t n, size_t s)
 {
-	void *r = malloc(n * s);
+	void *r = _malloc(get_alloc_site(), n * s);
 	if (!r)
 		return r;
 	memset(r, 0, n * s);
@@ -218,16 +292,16 @@ cfree(void *x)
 	free(x);
 }
 
-void *
-memalign(size_t boundary, size_t size)
+static void *
+_memalign(struct allocation_site *as, size_t boundary, size_t size)
 {
 	void *real_alloc;
 	void *aligned_alloc;
 	struct aligned_header *ah;
 
 	if (boundary <= 16)
-		return malloc(size);
-	real_alloc = malloc(size + boundary + sizeof(*ah));
+		return _malloc(as, size);
+	real_alloc = _malloc(as, size + boundary + sizeof(*ah));
 	aligned_alloc = real_alloc + sizeof(*ah);
 	aligned_alloc = (void *)((unsigned long)aligned_alloc + boundary -
 				 ((unsigned long)aligned_alloc % boundary));
@@ -236,6 +310,12 @@ memalign(size_t boundary, size_t size)
 	ah->h.aligned = 1;
 	ah->real_allocation = real_alloc;
 	return aligned_alloc;
+}
+
+void *
+memalign(size_t boundary, size_t size)
+{
+	return _memalign(get_alloc_site(), boundary, size);
 }
 
 size_t
@@ -250,11 +330,12 @@ malloc_usable_size(void *x)
 void *
 realloc(void *x, size_t s)
 {
+	struct allocation_site *as = get_alloc_site();
 	size_t old_size;
 	void *y;
 
 	if (!x)
-		return malloc(s);
+		return _malloc(as, s);
 	if (!s) {
 		free(x);
 		return NULL;
@@ -262,7 +343,7 @@ realloc(void *x, size_t s)
 	old_size = malloc_usable_size(x);
 	if (old_size >= s)
 		return x;
-	y = malloc(s);
+	y = _malloc(as, s);
 	memcpy(y, x, old_size);
 	free(x);
 	return y;
@@ -271,13 +352,13 @@ realloc(void *x, size_t s)
 void *
 valloc(size_t s)
 {
-	return memalign(PAGE_SIZE, s);
+	return _memalign(get_alloc_site(), PAGE_SIZE, s);
 }
 
 void *
 pvalloc(size_t s)
 {
-	return valloc((s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
+	return _memalign(get_alloc_site(), PAGE_SIZE, (s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
 }
 
 void *
@@ -294,20 +375,24 @@ malloc_set_state(void *x)
 void **
 independent_calloc(size_t n_elements, size_t element_size, void *chunks[])
 {
+	struct allocation_site *as = get_alloc_site();
 	int x;
 	void **res;
 	if (chunks)
 		res = chunks;
 	else
 		res = malloc(sizeof(void *) * n_elements);
-	for (x = 0; x < n_elements; x++)
-		res[x] = calloc(element_size, 1);
+	for (x = 0; x < n_elements; x++) {
+		res[x] = _malloc(as, element_size);
+		memset(res[x], 0, element_size);
+	}
 	return res;
 }
 
 void **
 independent_comalloc(size_t n_elements, size_t sizes[], void *chunks[])
 {
+	struct allocation_site *as = get_alloc_site();
 	void **res;
 	int x;
 
@@ -316,6 +401,6 @@ independent_comalloc(size_t n_elements, size_t sizes[], void *chunks[])
 	else
 		res = malloc(sizeof(void *) * n_elements);
 	for (x = 0; x < n_elements; x++)
-		res[x] = malloc(sizes[x]);
+		res[x] = _malloc(as, sizes[x]);
 	return res;
 }
