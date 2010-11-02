@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#define PAGE_SIZE 4096ul
+#define ARENA_MIN_SIZE PAGE_SIZE
+
 #define assert(x)					\
 	do {						\
 		if (!(x))				\
@@ -108,7 +111,7 @@ top:
 	}
 
 	/* Nothing in any of the available arenas.  Build a new one. */
-	arena_size = 1 << 20;
+	arena_size = ARENA_MIN_SIZE;
 	while (s > arena_size)
 		arena_size *= 2;
 
@@ -268,13 +271,13 @@ realloc(void *x, size_t s)
 void *
 valloc(size_t s)
 {
-	return memalign(4096, s);
+	return memalign(PAGE_SIZE, s);
 }
 
 void *
 pvalloc(size_t s)
 {
-	return valloc((s + 4095) & ~4095ul);
+	return valloc((s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
 }
 
 void *
