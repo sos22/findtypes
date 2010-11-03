@@ -1,6 +1,7 @@
 /* Very simple malloc implementation */
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -463,4 +464,67 @@ independent_comalloc(size_t n_elements, size_t sizes[], void *chunks[])
 	for (x = 0; x < n_elements; x++)
 		res[x] = _malloc(as, sizes[x]);
 	return res;
+}
+
+static long
+my_strtol(const char *start, int *error)
+{
+	long r;
+	char *e;
+
+	errno = 0;
+	r = strtol(start, &e, 10);
+	if (errno == ERANGE || e == start || *e != 0) {
+		*error = 1;
+		return -1;
+	} else {
+		*error = 0;
+		return r;
+	}
+}
+
+static int
+get_env_int(const char *name)
+{
+	char *var;
+	long val;
+	int err;
+
+	var = getenv(name);
+	if (!var)
+		errx(1, "%s not set", name);
+	val = my_strtol(var, &err);
+	if (err || val != (int)val)
+		errx(1, "%s not a valid integer", name);
+	return val;
+}
+
+static void initialise(void) __attribute__((constructor));
+static void
+initialise(void)
+{
+	int to_master_fd;
+	int from_master_fd;
+	int buf;
+	void *hash_table = as_hash_heads;
+
+	to_master_fd = get_env_int("_NDC_to_master");
+	from_master_fd = get_env_int("_NDC_from_master");
+
+	/* Tell master where our main lookup table is */
+	write(to_master_fd, &hash_table, sizeof(hash_table));
+	close(to_master_fd);
+	/* Wait for master to release us.  This should always fail,
+	   we're just waiting for the master to call close() */
+	read(from_master_fd, &buf, sizeof(buf));
+	close(from_master_fd);
+
+	/* Put everything back to how it was */
+	if (getenv("_NDC_ld_preload"))
+		setenv("LD_PRELOAD", getenv("_NDC_ld_preload"), 1);
+	else
+		unsetenv("LD_PRELOAD");
+	unsetenv("_NDC_to_master");
+	unsetenv("_NDC_from_master");
+	unsetenv("_NFC_ld_preload");
 }
