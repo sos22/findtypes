@@ -17,9 +17,7 @@
 
 struct arena {
 	struct arena *next;
-	struct arena *prev;
 	unsigned long size;
-	unsigned long pad;
 	char content[];
 };
 
@@ -151,7 +149,6 @@ top:
 		 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (a == MAP_FAILED)
 		return NULL;
-	a->prev = NULL;
 	a->next = as->head_arena;
 	a->size = arena_size - sizeof(struct arena);
 	head = (struct chunk_header *)a->content;
@@ -161,8 +158,6 @@ top:
 	footer = (struct chunk_footer *)((unsigned long)head + head->h.size) - 1;
 	footer->h = head->h;
 	footer->red = FOOTER_REDZONE;
-	if (as->head_arena)
-		as->head_arena->prev = a;
 	as->head_arena = a;
 	dbg("new arena %p\n", a);
 	goto top;
