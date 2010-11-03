@@ -18,6 +18,8 @@
 struct arena {
 	struct arena *next;
 	unsigned long size;
+	struct allocation_site *as;
+	unsigned long pad;
 	char content[];
 };
 
@@ -52,6 +54,7 @@ struct allocation_site {
 	struct allocation_site *next;
 	struct alloc_key key;
 	struct arena *head_arena;
+	unsigned long lock;
 };
 
 static struct allocation_site
@@ -80,6 +83,47 @@ alloc_keys_eq(const struct alloc_key *k1, const struct alloc_key *k2)
 }
 
 static void *
+cmpxchg_ptr(void **what, void *from, void *to)
+{
+	void *res;
+	asm volatile ("lock cmpxchg %[to], %[what]\n"
+		      : [what] "=m" (*what),
+			"=a" (res)
+		      : "1" (from),
+			[to] "r" (to)
+		      : "memory", "cc");
+	return res;
+}
+
+static unsigned long
+cmpxchg_ulong(unsigned long *what, unsigned long from, unsigned long to)
+{
+	unsigned long res;
+	asm volatile ("lock cmpxchg %[to], %[what]\n"
+		      : [what] "=m" (*what),
+			"=a" (res)
+		      : "1" (from),
+			[to] "r" (to)
+		      : "memory", "cc");
+	return res;
+}
+
+/* Read with acquire semantics */
+#define acquire_read(x) (*(volatile typeof(x) *)&(x))
+/* Write with release semantics */
+#define release_write(x, val)				\
+	do {						\
+		*(volatile typeof(x) *)&(x) = (val);	\
+	} while (0)
+
+/* Stall for a moment */
+static void
+relax(void)
+{
+	asm volatile("rep; nop\n");
+}
+
+static void *
 _malloc(struct allocation_site *as, size_t s)
 {
 	struct arena *a;
@@ -89,7 +133,10 @@ _malloc(struct allocation_site *as, size_t s)
 	size_t arena_size;
 
 	dbg("malloc(%zd)\n", s);
-#warning Acquire a lock of some sort
+
+	while (cmpxchg_ulong(&as->lock, 0, 1) != 0)
+		relax();
+
 	s = (s + 15 + sizeof(struct chunk_header) + sizeof(struct chunk_footer)) & ~15ul;
 	if (s >= (1 << 31)) {
 		/* Do it with mmap */
@@ -135,6 +182,7 @@ top:
 
 				/* We're done */
 				dbg("res %p\n", head + 1);
+				release_write(as->lock, 0);
 				return head + 1;
 			}
 		}
@@ -147,10 +195,13 @@ top:
 
 	a = mmap(NULL, arena_size, PROT_READ|PROT_WRITE,
 		 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (a == MAP_FAILED)
+	if (a == MAP_FAILED) {
+		release_write(as->lock, 0);
 		return NULL;
+	}
 	a->next = as->head_arena;
 	a->size = arena_size - sizeof(struct arena);
+	a->as = as;
 	head = (struct chunk_header *)a->content;
 	head->h.free = 1;
 	head->h.size = a->size;
@@ -173,22 +224,6 @@ top:
 		get_alloc_key(&key);		\
 		find_allocation_site(&key);	\
 	})
-
-static void *
-cmpxchg_ptr(void **what, void *from, void *to)
-{
-	void *res;
-	asm volatile ("lock cmpxchg %[to], %[what]\n"
-		      : [what] "=m" (*what),
-			"=a" (res)
-		      : "1" (from),
-			[to] "r" (to)
-		      : "memory", "cc");
-	return res;
-}
-
-/* Read with acquire semantics */
-#define acquire_read(x) (*(volatile typeof(x) *)&(x))
 
 static struct allocation_site *
 find_allocation_site(const struct alloc_key *k)
@@ -214,6 +249,7 @@ retry:
 	as = _malloc(&internal_allocation, sizeof(*as));
 	as->head_arena = NULL;
 	as->key = *k;
+	as->lock = 0;
 	as->next = orig_head;
 	if (cmpxchg_ptr((void **)&as_hash_heads[h], orig_head, as) != orig_head) {
 		printf("Race creating alloc site %lx\n", k->rip);
@@ -266,9 +302,11 @@ free(void *x)
 		return;
 	}
 	dbg("free %p\n", x);
+	a = header->arena;
+	while (cmpxchg_ulong(&a->as->lock, 0, 1) == 0)
+		relax();
 	header->h.free = 1;
 	dbg("header %p size %lx arena %p\n", header, header->h.size, header->arena);
-	a = header->arena;
 	footer = (struct chunk_footer *)((unsigned long)header + header->h.size) - 1;
 	dbg("footer %p\n", footer);
 	if ((unsigned long)header != (unsigned long)a->content) {
@@ -304,6 +342,8 @@ free(void *x)
 	}
 
 	footer->h = header->h;
+
+	release_write(a->as->lock, 0);
 }
 
 void
