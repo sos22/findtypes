@@ -179,28 +179,53 @@ top:
 		find_allocation_site(&key);	\
 	})
 
+static void *
+cmpxchg_ptr(void **what, void *from, void *to)
+{
+	void *res;
+	asm volatile ("lock cmpxchg %[to], %[what]\n"
+		      : [what] "=m" (*what),
+			"=a" (res)
+		      : "1" (from),
+			[to] "r" (to)
+		      : "memory", "cc");
+	return res;
+}
+
+/* Read with acquire semantics */
+#define acquire_read(x) (*(volatile typeof(x) *)&(x))
+
 static struct allocation_site *
 find_allocation_site(const struct alloc_key *k)
 {
-	struct allocation_site **pas, *as;
+	struct allocation_site **pas;
+	struct allocation_site *as, *orig_head;
 	unsigned h = hash_alloc_key(k);
+retry:
 	pas = &as_hash_heads[h];
-	as = *pas;
+	orig_head = acquire_read(*pas);
+	as = orig_head;
 	while (as) {
-		if (alloc_keys_eq(&as->key, k))
-			break;
+		if (alloc_keys_eq(&as->key, k)) {
+			dbg("Re-use alloc site %lx\n", k->rip);
+			return as;
+		}
 		pas = &as->next;
 		as = *pas;
 	}
-	if (as) {
-		*pas = as->next;
-	} else {
-		as = _malloc(&internal_allocation, sizeof(*as));
-		as->head_arena = NULL;
-		as->key = *k;
+	if (orig_head != *pas)
+		goto retry;
+
+	as = _malloc(&internal_allocation, sizeof(*as));
+	as->head_arena = NULL;
+	as->key = *k;
+	as->next = orig_head;
+	if (cmpxchg_ptr((void **)&as_hash_heads[h], orig_head, as) != orig_head) {
+		printf("Race creating alloc site %lx\n", k->rip);
+		free(as);
+		goto retry;
 	}
-	as->next = as_hash_heads[h];
-	as_hash_heads[h] = as;
+	dbg("New alloc site %lx\n", k->rip);
 	return as;
 }
 
