@@ -4,6 +4,7 @@
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/user.h>
 #include <sys/wait.h>
@@ -24,9 +25,12 @@
 #include <unistd.h>
 
 #include "ft.h"
+#include "shared.h"
 
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/findtypes/ft.so"
-#define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK)
+#define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEVFORK | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK)
+
+#define INTERVAL 1
 
 int
 thr_stop_status(const struct thread *thr)
@@ -277,10 +281,14 @@ start_process(char *argv[])
 	resume_child(head_thr);
 
 	/* Get the break address */
-	r = read(child->from_child_fd, &child->malloc_root_addr,
-		 sizeof(child->malloc_root_addr));
-	if (r != sizeof(child->malloc_root_addr))
+	r = read(child->from_child_fd, &child->malloc_hash,
+		 sizeof(child->malloc_hash));
+	if (r != sizeof(child->malloc_hash))
 		err(1, "reading child's malloc root address");
+	r = read(child->from_child_fd, &child->malloc_lock,
+		 sizeof(child->malloc_lock));
+	if (r != sizeof(child->malloc_lock))
+		err(1, "reading child's malloc lock address");
 
 	/* Close out our file descriptors to set it going properly. */
 	close(child->from_child_fd);
@@ -290,16 +298,247 @@ start_process(char *argv[])
 }
 
 static void
+_fetch_remote(struct process *proc, unsigned long addr, void *buf,
+	      size_t buf_size)
+{
+	int r = _fetch_bytes(list_first(&proc->threads,
+					struct thread,
+					list),
+			     addr,
+			     buf,
+			     buf_size);
+	if (r < 0)
+		err(1, "fetch_bytes(%lx)", addr);
+}
+
+#define fetch_remote(p, rptr)						\
+	({								\
+		typeof(rptr) res;					\
+		_fetch_remote((p),					\
+			      (unsigned long)&(rptr),			\
+			      &res,					\
+			      sizeof(res));				\
+		res;							\
+	})
+
+static void
+pause_process(struct process *p)
+{
+	struct thread *thr;
+	bool stopped;
+
+	kill(p->tgid, SIGSTOP);
+	while (1) {
+		stopped = true;
+		list_foreach(&p->threads, thr, list) {
+			if (thr->_stop_status == -1)
+				stopped = false;
+		}
+		if (stopped)
+			break;
+		receive_ptrace_event(p);
+	}
+}
+
+static void
+unpause_process(struct process *p)
+{
+	struct thread *thr;
+	list_foreach(&p->threads, thr, list) {
+		assert(thr->_stop_status != -1);
+		if (WIFSTOPPED(thr->_stop_status) &&
+		    WSTOPSIG(thr->_stop_status) == SIGSTOP) {
+			if (ptrace(PTRACE_CONT, thr->pid, NULL, NULL) < 0)
+				err(1, "resuming %d after pausing", thr->pid);
+			thr->_stop_status = -1;
+		}
+	}
+}
+
+static int
+acquire_malloc_lock(struct process *p)
+{
+	int cntr = 0;
+	unsigned l;
+	while (cntr < 100) {
+		pause_process(p);
+		l = fetch_remote(p, *p->malloc_lock);
+		if (l == 0)
+			return 0;
+		unpause_process(p);
+		dsleep(0.01);
+		cntr++;
+	}
+	return -1;
+}
+
+static void
+release_malloc_lock(struct process *p)
+{
+	unpause_process(p);
+}
+
+static void
+remote_mprotect(struct process *p, unsigned long start, unsigned long size, unsigned long prot)
+{
+	struct thread *thr = list_first(&p->threads, struct thread, list);
+	struct user_regs_struct old_regs, new_regs;
+	int status;
+
+	get_regs(thr, &old_regs);
+	new_regs = old_regs;
+	/* Hackety hackety hack: we assume that the vsyscall page
+	   includes a syscall instruction at a particular address. */
+	new_regs.rip = 0xffffffffff60004b;
+	new_regs.rax = __NR_mprotect;
+	new_regs.rdi = start;
+	new_regs.rsi = size;
+	new_regs.rdx = prot;
+	set_regs(thr, &new_regs);
+
+	/* Now step it through the syscall. */
+retry1:
+	if (ptrace(PTRACE_SYSCALL, thr->pid, NULL, NULL) < 0)
+		err(1, "PTRACE_SYSCALL1");
+	if (waitpid(thr->pid, &status, __WALL) < 0)
+		err(1, "waitpid for mprotect 1");
+	/* ptrace confuses the crap out of me.  Do what seems to be
+	   necessary to make it work. */
+	if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP)
+		goto retry1;
+
+	if (ptrace(PTRACE_SYSCALL, thr->pid, NULL, NULL) < 0)
+		err(1, "PTRACE_SYSCALL2");
+	if (waitpid(thr->pid, &status, __WALL) < 0)
+		err(1, "waitpid for mprotect 1");
+
+	/* Did it work? */
+	get_regs(thr, &new_regs);
+	if (new_regs.rax != 0) {
+		errno = new_regs.rax;
+		err(1, "remote_mprotect(%d, %lx, %lx, %lx)",
+		    thr->pid, start, size, prot);
+	}
+
+	/* Put it back to how it was */
+	set_regs(thr, &old_regs);
+}
+
+static void
+stop_investigating(struct process *p, struct allocation_site *ah)
+{
+	struct arena *a;
+	unsigned long s;
+	struct thread *thr;
+
+	printf("Stop investigating %p\n", ah);
+	for (a = fetch_remote(p, ah->head_arena);
+	     a != NULL;
+	     a = fetch_remote(p, a->next)) {
+		printf("Restore access to %#lx:%#lx\n",
+		       (unsigned long)a, (unsigned long)a + PAGE_SIZE);
+		remote_mprotect(p, (unsigned long)a, PAGE_SIZE, PROT_READ|PROT_WRITE);
+		s = fetch_remote(p, a->size);
+		if (s > PAGE_SIZE) {
+			printf("Restore access to %#lx:%#lx\n",
+			       (unsigned long)a, (unsigned long)a + s);
+			remote_mprotect(p, (unsigned long)a, s, PROT_READ|PROT_WRITE);
+		}
+	}
+
+	/* Clear out any threads which have picked up SEGVs which
+	 * we've not collected (can happen due to a race when
+	 * re-enabling access). */
+	list_foreach(&p->threads, thr, list) {
+		if (thr_is_stopped(thr) &&
+		    WIFSTOPPED(thr_stop_status(thr)) &&
+		    WSTOPSIG(thr_stop_status(thr)) == SIGSEGV)
+			thr->_stop_status = __W_STOPCODE(SIGSTOP);
+	}
+}
+
+static void
+start_investigating(struct process *p, struct allocation_site *ah)
+{
+	struct arena *a, *next;
+	unsigned long s;
+
+	printf("Start investigating %p\n", ah);
+	for (a = fetch_remote(p, ah->head_arena);
+	     a != NULL;
+	     a = next) {
+		next = fetch_remote(p, a->next);
+		s = fetch_remote(p, a->size) + sizeof(*a);
+		printf("Revoke access to %#lx:%#lx\n",
+		       (unsigned long)a, (unsigned long)a + s);
+		remote_mprotect(p, (unsigned long)a, s, 0);
+	}
+}
+
+static void
 change_investigated_type(struct process *p)
 {
-	printf("Should change investigated type about now.\n");
+	static unsigned target_cntr;
+	static struct allocation_site *currently_investigated;
+	unsigned x;
+	struct allocation_site *ah;
+	unsigned cntr;
+	bool no_sites;
+
+	if (acquire_malloc_lock(p) < 0)
+		return;
+
+retry:
+	cntr = 0;
+	no_sites = true;
+	for (x = 0; x < NR_AS_HASH_HEADS; x++) {
+		ah = fetch_remote(p, p->malloc_hash[x]);
+		while (ah) {
+			no_sites = false;
+			if (ah == currently_investigated) {
+				stop_investigating(p, ah);
+				currently_investigated = NULL;
+			}
+			if (cntr == target_cntr) {
+				assert(!currently_investigated);
+				start_investigating(p, ah);
+				currently_investigated = ah;
+				target_cntr++;
+				release_malloc_lock(p);
+				return;
+			}
+			cntr++;
+			ah = fetch_remote(p, ah->next);
+		}
+	}
+	if (no_sites) {
+		release_malloc_lock(p);
+		return;
+	}
+
+	target_cntr = 0;
+	goto retry;
+}
+
+static void
+child_got_segv(struct thread *thr)
+{
+	siginfo_t si;
+	struct user_regs_struct regs;
+
+	if (ptrace(PTRACE_GETSIGINFO, thr->pid, NULL, &si) < 0)
+		err(1, "ptrace(PTRACE_GETSIGINFO) after child segv");
+	get_regs(thr, &regs);
+	printf("Child %d got segv at %p, rip %lx\n",
+	       thr->pid, si.si_addr, regs.rip);
+	emulate_instruction(thr);
+	resume_child(thr);
 }
 
 int
 main(int argc, char *argv[])
 {
 	struct process *child;
-	struct thread *head_thr;
 	int arg_index;
 
 	on_exit(maybe_dump_debug_ring, NULL);
@@ -313,14 +552,14 @@ main(int argc, char *argv[])
 
 	/* Give it a few seconds to get through any initialisation
 	 * code. */
-	sleep(5);
+	dsleep(INTERVAL);
 
 	/* wait() and friends don't have convenient timeout arguments,
 	   and doing it with signals is a pain, so just have a child
 	   process which sleeps 60 seconds and then exits. */
 	child->timeout_pid = fork();
 	if (child->timeout_pid == 0) {
-		dsleep(10);
+		dsleep(INTERVAL);
 		_exit(0);
 	}
 
@@ -328,27 +567,15 @@ main(int argc, char *argv[])
 		struct thread *thr;
 		bool nothing_ready;
 
-		if (child->timeout_fired) {
-			int status;
-
-			head_thr = list_first(&child->threads, struct thread, list);
-			status = head_thr->_stop_status;
-			if (status == -1)
-				pause_child(head_thr);
-
-			change_investigated_type(child);
-
-			if (status == -1)
-				unpause_child(head_thr);
-
-			child->timeout_fired = false;
-			child->timeout_pid = fork();
-			if (child->timeout_pid == 0) {
-				dsleep(10);
-				_exit(0);
-			}
-
-		}
+               if (child->timeout_fired) {
+                       change_investigated_type(child);
+                       child->timeout_fired = false;
+                       child->timeout_pid = fork();
+                       if (child->timeout_pid == 0) {
+                               dsleep(INTERVAL);
+                               _exit(0);
+                       }
+               }
 
 		nothing_ready = true;
 		list_foreach(&child->threads, thr, list) {
@@ -393,20 +620,24 @@ main(int argc, char *argv[])
 				fprintf(stderr, "unknown ptrace event %d\n", thr_stop_status(thr) >> 16);
 				abort();
 			}
-		} else if (WIFSTOPPED(thr_stop_status(thr)) &&
-			   WSTOPSIG(thr_stop_status(thr)) == SIGSTOP) {
-			/* Sometimes get these spuriously when
-			 * attaching to a new thread or as a resule of
-			 * pause_thread().  Ignore. */
-			resume_child(thr);
 		} else if (WIFSTOPPED(thr_stop_status(thr))) {
-			msg(20, "Sending signal %d to child %d\n",
-			    WSTOPSIG(thr_stop_status(thr)), thr->pid);
-			if (ptrace(PTRACE_CONT, thr->pid, NULL,
-				   (unsigned long)WSTOPSIG(thr_stop_status(thr))) < 0)
-				err(1, "forwarding signal %d to child %d with ptrace",
+			if (WSTOPSIG(thr_stop_status(thr)) == SIGSTOP) {
+				/* Sometimes get these spuriously when
+				 * attaching to a new thread or as a
+				 * resule of pause_thread().
+				 * Ignore. */
+				resume_child(thr);
+			} else if (WSTOPSIG(thr_stop_status(thr)) == SIGSEGV) {
+				child_got_segv(thr);
+			} else {
+				msg(20, "Sending signal %d to child %d\n",
 				    WSTOPSIG(thr_stop_status(thr)), thr->pid);
-			thr_resume(thr);
+				if (ptrace(PTRACE_CONT, thr->pid, NULL,
+					   (unsigned long)WSTOPSIG(thr_stop_status(thr))) < 0)
+					err(1, "forwarding signal %d to child %d with ptrace",
+					    WSTOPSIG(thr_stop_status(thr)), thr->pid);
+				thr_resume(thr);
+			}
 		} else {
 			fprintf(stderr, "unexpected waitpid status %x\n", thr_stop_status(thr));
 			abort();

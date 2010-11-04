@@ -74,7 +74,6 @@ _fetch_bytes(struct thread *thr, unsigned long addr, void *buf, size_t buf_size)
 			ptrace(PTRACE_PEEKDATA, thr->pid, cursor);
 		if (errno != 0) {
 			/* Failed */
-			free(aligned_buf);
 			return -1;
 		}
 	}
@@ -104,6 +103,14 @@ store_byte(struct thread *thr, unsigned long addr, unsigned char byte)
 	u.buf = fetch_ulong(thr, addr);
 	u.bytes[byte_idx] = byte;
 	store_ulong(thr, addr, u.buf);
+}
+
+void
+store_bytes(struct thread *thr, unsigned long start, const void *data, int size)
+{
+	int x;
+	for (x = 0; x < size; x++)
+		store_byte(thr, start + x, ((unsigned char *)data)[x]);
 }
 
 struct breakpoint *

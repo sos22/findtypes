@@ -1,28 +1,15 @@
 /* Very simple malloc implementation */
+//#define NDEBUG
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 
+#include "shared.h"
+
 #define PAGE_SIZE 4096ul
 #define ARENA_MIN_SIZE PAGE_SIZE
-
-#define assert(x)					\
-	do {						\
-		if (!(x))				\
-			*(unsigned long *)NULL = 5;	\
-	} while (0)
-
-#define dbg(x, ...) do { } while (0)
-
-struct arena {
-	struct arena *next;
-	unsigned long size;
-	struct allocation_site *as;
-	unsigned long pad;
-	char content[];
-};
 
 /* Present at head and foot of every allocation */
 struct chunk_word {
@@ -47,40 +34,43 @@ struct chunk_footer {
 	struct chunk_word h;
 };
 
-struct alloc_key {
-	unsigned long rip;
-};
+#ifdef NDEBUG
+#define assert(x) do {} while (0)
+#else
+#define assert(x)					\
+	do {						\
+		if (!(x))				\
+			*(unsigned long *)NULL = 5;	\
+	} while (0)
+#endif
 
-struct allocation_site {
-	struct allocation_site *next;
-	struct alloc_key key;
-	struct arena *head_arena;
-	unsigned long lock;
-};
+//#define dbg(x, ...) do { printf((x), ## __VA_ARGS__ ); } while (0)
+#define dbg(x, ...) do {} while (0)
 
 static struct allocation_site
 internal_allocation;
 
-#define NR_AS_HASH_HEADS 4096
 static struct allocation_site *
 as_hash_heads[NR_AS_HASH_HEADS];
+static unsigned
+lock;
 
 static unsigned
 hash_alloc_key(const struct alloc_key *key)
 {
 	unsigned hash = 0;
-	unsigned long rip = key->rip;
+	unsigned long rip = key->rip ^ (key->size * 4296540811ul);
 	while (rip) {
 		hash ^= rip % NR_AS_HASH_HEADS;
 		rip /= NR_AS_HASH_HEADS;
 	}
-	return hash;
+	return hash % NR_AS_HASH_HEADS;
 }
 
 static int
 alloc_keys_eq(const struct alloc_key *k1, const struct alloc_key *k2)
 {
-	return k1->rip == k2->rip;
+	return k1->rip == k2->rip && k1->size == k2->size;
 }
 
 static void *
@@ -96,10 +86,10 @@ cmpxchg_ptr(void **what, void *from, void *to)
 	return res;
 }
 
-static unsigned long
-cmpxchg_ulong(unsigned long *what, unsigned long from, unsigned long to)
+static unsigned
+cmpxchg_uint(unsigned *what, unsigned from, unsigned to)
 {
-	unsigned long res;
+	unsigned res;
 	asm volatile ("lock cmpxchg %[to], %[what]\n"
 		      : [what] "=m" (*what),
 			"=a" (res)
@@ -135,7 +125,7 @@ _malloc(struct allocation_site *as, size_t s)
 
 	dbg("malloc(%zd)\n", s);
 
-	while (cmpxchg_ulong(&as->lock, 0, 1) != 0)
+	while (cmpxchg_uint(&lock, 0, 1) != 0)
 		relax();
 
 	s = (s + 15 + sizeof(struct chunk_header) + sizeof(struct chunk_footer)) & ~15ul;
@@ -152,9 +142,11 @@ top:
 			head = (struct chunk_header *)(a->content + offset);
 			footer = (struct chunk_footer *)((unsigned long)head + head->h.size) - 1;
 			dbg("Inspect %p size %lx free %d\n", head,
-			       (unsigned long)head->h.size, head->h.free);
+			    (unsigned long)head->h.size, head->h.free);
 			assert(head->h.free == footer->h.free);
 			assert(head->h.size == footer->h.size);
+			assert(!head->h.aligned);
+			assert(!footer->h.aligned);
 			assert(footer->red == FOOTER_REDZONE);
 			if (head->h.free && head->h.size >= s) {
 				/* Grab it. */
@@ -171,19 +163,20 @@ top:
 
 					next_head->h.size = head->h.size - s;
 					next_head->h.free = 1;
+					next_head->h.aligned = 0;
 					next_head->arena = a;
 					next_footer->h = next_head->h;
 					next_footer->red = FOOTER_REDZONE;
 					head->h.size = s;
 					dbg("split %p to size %lx; next %p size %lx\n",
-					       head, s, next_head, (unsigned long)next_head->h.size);
+					    head, s, next_head, (unsigned long)next_head->h.size);
 				}
 
 				footer->h = head->h;
 
 				/* We're done */
 				dbg("res %p\n", head + 1);
-				release_write(as->lock, 0);
+				release_write(lock, 0);
 				return head + 1;
 			}
 		}
@@ -191,13 +184,13 @@ top:
 
 	/* Nothing in any of the available arenas.  Build a new one. */
 	arena_size = ARENA_MIN_SIZE;
-	while (s > arena_size)
+	while (s * 32 > arena_size)
 		arena_size *= 2;
 
 	a = mmap(NULL, arena_size, PROT_READ|PROT_WRITE,
 		 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (a == MAP_FAILED) {
-		release_write(as->lock, 0);
+		release_write(lock, 0);
 		return NULL;
 	}
 	a->next = as->head_arena;
@@ -215,14 +208,15 @@ top:
 	goto top;
 }
 
-#define get_alloc_key(as)						\
+#define get_alloc_key(as, sz)						\
 	do {								\
 		(as)->rip = (unsigned long)__builtin_return_address(0);	\
+		(as)->size = (sz);					\
 	} while (0)
-#define get_alloc_site()			\
+#define get_alloc_site(sz)			\
 	({					\
 		struct alloc_key key;		\
-		get_alloc_key(&key);		\
+		get_alloc_key(&key, sz);	\
 		find_allocation_site(&key);	\
 	})
 
@@ -244,33 +238,32 @@ retry:
 		pas = &as->next;
 		as = *pas;
 	}
-	if (orig_head != *pas)
+	if (orig_head != as_hash_heads[h])
 		goto retry;
 
 	as = _malloc(&internal_allocation, sizeof(*as));
 	as->head_arena = NULL;
 	as->key = *k;
-	as->lock = 0;
 	as->next = orig_head;
 	if (cmpxchg_ptr((void **)&as_hash_heads[h], orig_head, as) != orig_head) {
 		printf("Race creating alloc site %lx\n", k->rip);
 		free(as);
 		goto retry;
 	}
-	dbg("New alloc site %lx\n", k->rip);
+	dbg("New alloc site %d %lx\n", h, k->rip);
 	return as;
 }
 
 void *
 malloc(size_t s)
 {
-	return _malloc(get_alloc_site(), s);
+	return _malloc(get_alloc_site(s), s);
 }
 
 void *
 calloc(size_t n, size_t s)
 {
-	void *r = _malloc(get_alloc_site(), n * s);
+	void *r = _malloc(get_alloc_site(n*s), n * s);
 	if (!r)
 		return r;
 	memset(r, 0, n * s);
@@ -303,9 +296,11 @@ free(void *x)
 		return;
 	}
 	dbg("free %p\n", x);
-	a = header->arena;
-	while (cmpxchg_ulong(&a->as->lock, 0, 1) == 0)
+
+	while (cmpxchg_uint(&lock, 0, 1) == 0)
 		relax();
+
+	a = header->arena;
 	header->h.free = 1;
 	dbg("header %p size %lx arena %p\n", header, header->h.size, header->arena);
 	footer = (struct chunk_footer *)((unsigned long)header + header->h.size) - 1;
@@ -321,7 +316,7 @@ free(void *x)
 			prev_header->h.size += header->h.size;
 			header = prev_header;
 			dbg("merge backwards to %p new size %lx\n",
-			       prev_header, prev_header->h.size);
+			    prev_header, prev_header->h.size);
 		}
 	}
 
@@ -338,13 +333,13 @@ free(void *x)
 			header->h.size += next_header->h.size;
 			footer = next_footer;
 			dbg("merge forwards to %p new size %lx\n",
-			       next_header, header->h.size);
+			    next_header, header->h.size);
 		}
 	}
 
 	footer->h = header->h;
 
-	release_write(a->as->lock, 0);
+	release_write(lock, 0);
 }
 
 void
@@ -376,7 +371,7 @@ _memalign(struct allocation_site *as, size_t boundary, size_t size)
 void *
 memalign(size_t boundary, size_t size)
 {
-	return _memalign(get_alloc_site(), boundary, size);
+	return _memalign(get_alloc_site(size), boundary, size);
 }
 
 size_t
@@ -391,7 +386,7 @@ malloc_usable_size(void *x)
 void *
 realloc(void *x, size_t s)
 {
-	struct allocation_site *as = get_alloc_site();
+	struct allocation_site *as = get_alloc_site(s);
 	size_t old_size;
 	void *y;
 
@@ -413,13 +408,13 @@ realloc(void *x, size_t s)
 void *
 valloc(size_t s)
 {
-	return _memalign(get_alloc_site(), PAGE_SIZE, s);
+	return _memalign(get_alloc_site(s), PAGE_SIZE, s);
 }
 
 void *
 pvalloc(size_t s)
 {
-	return _memalign(get_alloc_site(), PAGE_SIZE, (s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
+	return _memalign(get_alloc_site(s), PAGE_SIZE, (s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
 }
 
 void *
@@ -436,7 +431,7 @@ malloc_set_state(void *x)
 void **
 independent_calloc(size_t n_elements, size_t element_size, void *chunks[])
 {
-	struct allocation_site *as = get_alloc_site();
+	struct allocation_site *as = get_alloc_site(element_size);
 	int x;
 	void **res;
 	if (chunks)
@@ -453,7 +448,6 @@ independent_calloc(size_t n_elements, size_t element_size, void *chunks[])
 void **
 independent_comalloc(size_t n_elements, size_t sizes[], void *chunks[])
 {
-	struct allocation_site *as = get_alloc_site();
 	void **res;
 	int x;
 
@@ -462,7 +456,7 @@ independent_comalloc(size_t n_elements, size_t sizes[], void *chunks[])
 	else
 		res = malloc(sizeof(void *) * n_elements);
 	for (x = 0; x < n_elements; x++)
-		res[x] = _malloc(as, sizes[x]);
+		res[x] = _malloc(get_alloc_site(sizes[x]), sizes[x]);
 	return res;
 }
 
@@ -507,12 +501,18 @@ initialise(void)
 	int from_master_fd;
 	int buf;
 	void *hash_table = as_hash_heads;
+	void *lock_address = &lock;
+
+	if (!getenv("_NDC_to_master")) /* Just use the allocator */
+		return;
 
 	to_master_fd = get_env_int("_NDC_to_master");
 	from_master_fd = get_env_int("_NDC_from_master");
 
 	/* Tell master where our main lookup table is */
 	write(to_master_fd, &hash_table, sizeof(hash_table));
+	write(to_master_fd, &lock_address, sizeof(lock_address));
+
 	close(to_master_fd);
 	/* Wait for master to release us.  This should always fail,
 	   we're just waiting for the master to call close() */

@@ -134,7 +134,10 @@ struct pending_wait_status {
 struct process {
 	struct list_head threads;
 
-	unsigned long malloc_root_addr;
+	/* Careful: points at remote address space */
+	struct allocation_site **malloc_hash;
+	unsigned *malloc_lock;
+
 	int tgid;
 	int to_child_fd;
 	int from_child_fd;
@@ -159,6 +162,7 @@ void get_regs(struct thread *thr, struct user_regs_struct *urs);
 void set_regs(struct thread *thr, const struct user_regs_struct *urs);
 int _fetch_bytes(struct thread *thr, unsigned long addr, void *buf, size_t buf_size);
 void store_byte(struct thread *thr, unsigned long addr, unsigned char byte);
+void store_bytes(struct thread *thr, unsigned long start, const void *data, int size);
 
 void resume_child(struct thread *thr);
 bool pause_child(struct thread *thr);
