@@ -339,9 +339,7 @@ unpause_process(struct process *p)
 		assert(thr->_stop_status != -1);
 		if (WIFSTOPPED(thr->_stop_status) &&
 		    WSTOPSIG(thr->_stop_status) == SIGSTOP) {
-			if (ptrace(PTRACE_CONT, thr->pid, NULL, NULL) < 0)
-				err(1, "resuming %d after pausing", thr->pid);
-			thr->_stop_status = -1;
+			resume_child(thr);
 		}
 	}
 }
@@ -377,6 +375,21 @@ remote_mprotect(struct process *p, unsigned long start, unsigned long size, unsi
 	int status;
 
 	get_regs(thr, &old_regs);
+	printf("rax %lx, orig_rax %lx\n", old_regs.rax, old_regs.orig_rax);
+
+	if (old_regs.orig_rax != ~0ul) {
+		/* The thread is already in the middle of a
+		 * syscall.  */
+		if (-old_regs.rax == 516 ||
+		    -old_regs.rax == 514) {
+			/* Yurk.  The kernel won't automatically
+			   restart these types, and it confuses
+			   various programs (e.g. anything based on
+			   glib).  Do it manually. */
+			old_regs.rip -= 2;
+			old_regs.rax = old_regs.orig_rax;
+		}
+	}
 	new_regs = old_regs;
 	/* Hackety hackety hack: we assume that the vsyscall page
 	   includes a syscall instruction at a particular address. */
@@ -480,14 +493,13 @@ change_investigated_type(struct process *p)
 retry:
 	cntr = 0;
 	no_sites = true;
+	if (currently_investigated)
+		stop_investigating(p, currently_investigated);
+	currently_investigated = NULL;
 	for (x = 0; x < NR_AS_HASH_HEADS; x++) {
 		ah = fetch_remote(p, p->malloc_hash[x]);
 		while (ah) {
 			no_sites = false;
-			if (ah == currently_investigated) {
-				stop_investigating(p, ah);
-				currently_investigated = NULL;
-			}
 			if (cntr == target_cntr) {
 				assert(!currently_investigated);
 				start_investigating(p, ah);
