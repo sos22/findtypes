@@ -192,6 +192,7 @@ emulate_instruction(struct thread *thr)
 	_fetch_bytes(thr, urs.rip, buf, 16);
 	LibVEX_default_VexArchInfo(&vai);
 	LibVEX_default_VexAbiInfo(&vabi);
+	vabi.guest_stack_redzone_size = 128;
 	irsb = emptyIRSB();
 	dr = disInstr_AMD64(irsb, False, resteerOkFn,
 			    NULL, tmf, 0,

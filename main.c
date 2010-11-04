@@ -204,28 +204,18 @@ handle_fork(struct thread *thr)
 {
 	unsigned long new_pid;
 	int status;
-	struct breakpoint *bp;
-	struct thread new_thr;
 
 	/* Wait for the kernel to attach it to us */
 	if (ptrace(PTRACE_GETEVENTMSG, thr->pid, NULL, &new_pid) < 0)
 		err(1, "PTRACE_GETEVENTMSG() for fork");
+	msg(10, "%d forked %zd, ignoring...\n", thr->pid, new_pid);
 	status = get_stop_status(new_pid, &thr->process->pws);
 	if (!WIFSTOPPED(status))
 		errx(1, "unexpected status %x for fork", status);
 
-	/* Hack: fake up a thread structure so that we have something
-	 * to pass to store_byte */
-	bzero(&new_thr, sizeof(new_thr));
-	new_thr.pid = new_pid;
-	list_foreach(&thr->process->breakpoints, bp, list_process)
-		store_byte(&new_thr, bp->addr, bp->old_content);
-
 	/* Detach it and let it go */
 	if (ptrace(PTRACE_DETACH, new_pid) < 0)
-		err(1, "detaching forked child");
-
-	msg(10, "%d forked %zd, ignoring...\n", thr->pid, new_pid);
+		warn("detaching forked child");
 }
 
 static void
@@ -327,12 +317,13 @@ pause_process(struct process *p)
 	struct thread *thr;
 	bool stopped;
 
-	kill(p->tgid, SIGSTOP);
 	while (1) {
 		stopped = true;
 		list_foreach(&p->threads, thr, list) {
-			if (thr->_stop_status == -1)
+			if (thr->_stop_status == -1) {
+				tgkill(p->tgid, thr->pid, SIGSTOP);
 				stopped = false;
+			}
 		}
 		if (stopped)
 			break;
@@ -428,22 +419,19 @@ static void
 stop_investigating(struct process *p, struct allocation_site *ah)
 {
 	struct arena *a;
-	unsigned long s;
 	struct thread *thr;
+	void *data;
+	unsigned s;
 
 	printf("Stop investigating %p\n", ah);
 	for (a = fetch_remote(p, ah->head_arena);
 	     a != NULL;
 	     a = fetch_remote(p, a->next)) {
-		printf("Restore access to %#lx:%#lx\n",
-		       (unsigned long)a, (unsigned long)a + PAGE_SIZE);
-		remote_mprotect(p, (unsigned long)a, PAGE_SIZE, PROT_READ|PROT_WRITE);
+		data = fetch_remote(p, a->data);
 		s = fetch_remote(p, a->size);
-		if (s > PAGE_SIZE) {
-			printf("Restore access to %#lx:%#lx\n",
-			       (unsigned long)a, (unsigned long)a + s);
-			remote_mprotect(p, (unsigned long)a, s, PROT_READ|PROT_WRITE);
-		}
+		printf("Restore access to %#lx:%#lx\n",
+		       (unsigned long)data, (unsigned long)data + size_to_arena_size(s));
+		remote_mprotect(p, (unsigned long)data, size_to_arena_size(s), PROT_READ|PROT_WRITE);
 	}
 
 	/* Clear out any threads which have picked up SEGVs which
@@ -460,18 +448,19 @@ stop_investigating(struct process *p, struct allocation_site *ah)
 static void
 start_investigating(struct process *p, struct allocation_site *ah)
 {
-	struct arena *a, *next;
+	struct arena *a;
 	unsigned long s;
+	void *data;
 
 	printf("Start investigating %p\n", ah);
 	for (a = fetch_remote(p, ah->head_arena);
 	     a != NULL;
-	     a = next) {
-		next = fetch_remote(p, a->next);
-		s = fetch_remote(p, a->size) + sizeof(*a);
+	     a = fetch_remote(p, a->next)) {
+		data = fetch_remote(p, a->data);
+		s = size_to_arena_size(fetch_remote(p, a->size));
 		printf("Revoke access to %#lx:%#lx\n",
-		       (unsigned long)a, (unsigned long)a + s);
-		remote_mprotect(p, (unsigned long)a, s, 0);
+		       (unsigned long)data, (unsigned long)data + s);
+		remote_mprotect(p, (unsigned long)data, s, 0);
 	}
 }
 

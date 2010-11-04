@@ -2,37 +2,14 @@
 //#define NDEBUG
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/user.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "shared.h"
-
-#define PAGE_SIZE 4096ul
-#define ARENA_MIN_SIZE PAGE_SIZE
-
-/* Present at head and foot of every allocation */
-struct chunk_word {
-	unsigned long size:62;
-	unsigned free:1;
-	unsigned aligned:1;
-};
-
-struct chunk_header {
-	struct chunk_word h;
-	struct arena *arena;
-};
-
-struct aligned_header {
-	struct chunk_word h;
-	void *real_allocation;
-};
-
-#define FOOTER_REDZONE 0x11223344aabbccddul
-struct chunk_footer {
-	unsigned long red;
-	struct chunk_word h;
-};
 
 #ifdef NDEBUG
 #define assert(x) do {} while (0)
@@ -115,117 +92,33 @@ relax(void)
 }
 
 static void *
-_malloc(struct allocation_site *as, size_t s)
+allocate_in_arena(struct arena *a, size_t s)
 {
-	struct arena *a;
-	struct chunk_header *head, *next_head;
-	struct chunk_footer *footer, *next_footer;
-	unsigned offset;
-	size_t arena_size;
-
-	dbg("malloc(%zd)\n", s);
-
-	while (cmpxchg_uint(&lock, 0, 1) != 0)
-		relax();
-
-	s = (s + 15 + sizeof(struct chunk_header) + sizeof(struct chunk_footer)) & ~15ul;
-	if (s >= (1 << 31)) {
-		/* Do it with mmap */
-		abort();
-#warning Write me
-	}
-	dbg("malloc2(%zd)\n", s);
-top:
-	for (a = as->head_arena; a; a = a->next) {
-		dbg("arena %p\n", a);
-		for (offset = 0; offset != a->size; offset += head->h.size) {
-			head = (struct chunk_header *)(a->content + offset);
-			footer = (struct chunk_footer *)((unsigned long)head + head->h.size) - 1;
-			dbg("Inspect %p size %lx free %d\n", head,
-			    (unsigned long)head->h.size, head->h.free);
-			assert(head->h.free == footer->h.free);
-			assert(head->h.size == footer->h.size);
-			assert(!head->h.aligned);
-			assert(!footer->h.aligned);
-			assert(footer->red == FOOTER_REDZONE);
-			if (head->h.free && head->h.size >= s) {
-				/* Grab it. */
-				dbg("grab %p\n", head);
-				head->h.free = 0;
-				assert(footer->red == FOOTER_REDZONE);
-				if (head->h.size >= s + 64) {
-					/* Split */
-					next_footer = footer;
-					footer =
-						(struct chunk_footer *)((unsigned long)head + s) - 1;
-					footer->red = FOOTER_REDZONE;
-					next_head = (struct chunk_header *)(footer + 1);
-
-					next_head->h.size = head->h.size - s;
-					next_head->h.free = 1;
-					next_head->h.aligned = 0;
-					next_head->arena = a;
-					next_footer->h = next_head->h;
-					next_footer->red = FOOTER_REDZONE;
-					head->h.size = s;
-					dbg("split %p to size %lx; next %p size %lx\n",
-					    head, s, next_head, (unsigned long)next_head->h.size);
-				}
-
-				footer->h = head->h;
-
-				/* We're done */
-				dbg("res %p\n", head + 1);
-				release_write(lock, 0);
-				return head + 1;
-			}
+	int idx;
+	assert(a->nr_free != 0);
+	idx = 0;
+	while (1) {
+		if (a->free_bitmap[idx / 8] & (1 << (idx % 8))) {
+			a->free_bitmap[idx / 8] &= ~(1 << (idx % 8));
+			a->nr_free--;
+			return a->data + idx * s + sizeof(struct arena *);
 		}
+		idx++;
 	}
-
-	/* Nothing in any of the available arenas.  Build a new one. */
-	arena_size = ARENA_MIN_SIZE;
-	while (s * 32 > arena_size)
-		arena_size *= 2;
-
-	a = mmap(NULL, arena_size, PROT_READ|PROT_WRITE,
-		 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (a == MAP_FAILED) {
-		release_write(lock, 0);
-		return NULL;
-	}
-	a->next = as->head_arena;
-	a->size = arena_size - sizeof(struct arena);
-	a->as = as;
-	head = (struct chunk_header *)a->content;
-	head->h.free = 1;
-	head->h.size = a->size;
-	head->arena = a;
-	footer = (struct chunk_footer *)((unsigned long)head + head->h.size) - 1;
-	footer->h = head->h;
-	footer->red = FOOTER_REDZONE;
-	as->head_arena = a;
-	dbg("new arena %p\n", a);
-	goto top;
 }
 
-#define get_alloc_key(as, sz)						\
-	do {								\
-		(as)->rip = (unsigned long)__builtin_return_address(0);	\
-		(as)->size = (sz);					\
-	} while (0)
-#define get_alloc_site(sz)			\
-	({					\
-		struct alloc_key key;		\
-		get_alloc_key(&key, sz);	\
-		find_allocation_site(&key);	\
-	})
+
+static void *_internal_malloc(void *ra, size_t s);
+#define internal_malloc(s) _internal_malloc(__builtin_return_address(0), (s))
 
 static struct allocation_site *
 find_allocation_site(const struct alloc_key *k)
 {
 	struct allocation_site **pas;
-	struct allocation_site *as, *orig_head;
+	struct allocation_site *as, *orig_head, *new_as;
 	unsigned h = hash_alloc_key(k);
+
+	new_as = NULL;
 retry:
 	pas = &as_hash_heads[h];
 	orig_head = acquire_read(*pas);
@@ -241,103 +134,137 @@ retry:
 	if (orig_head != as_hash_heads[h])
 		goto retry;
 
-	as = _malloc(&internal_allocation, sizeof(*as));
+	if (new_as)
+		as = new_as;
+	else
+		as = sbrk(sizeof(*as));
 	as->head_arena = NULL;
 	as->key = *k;
 	as->next = orig_head;
 	if (cmpxchg_ptr((void **)&as_hash_heads[h], orig_head, as) != orig_head) {
 		printf("Race creating alloc site %lx\n", k->rip);
-		free(as);
+		/* This can leak, but it should be rare enough not to matter. */
+		new_as = as;
 		goto retry;
 	}
 	dbg("New alloc site %d %lx\n", h, k->rip);
 	return as;
 }
 
+static void *
+_internal_malloc(void *ra, size_t s)
+{
+	struct alloc_key ak;
+	struct allocation_site *as;
+	struct arena *arena;
+	void *res;
+	size_t data_size;
+	size_t arena_size;
+	int i;
+
+	dbg("malloc(%p, %zd)\n", ra, s);
+
+	s += sizeof(struct arena *);
+	s = (s + 7) & ~7ul;
+
+	if (s >= (1ul << 31)) {
+		/* Do it with mmap */
+		abort();
+#warning Write me
+	}
+
+	ak.rip = (unsigned long)ra;
+	ak.size = s;
+	as = find_allocation_site(&ak);
+	while (cmpxchg_uint(&lock, 0, 1) != 0)
+		relax();
+
+	dbg("malloc2(%zd)\n", s);
+
+	for (arena = as->head_arena; arena; arena = arena->next) {
+		dbg("arena %p\n", a);
+		if (arena->nr_free) {
+			res = allocate_in_arena(arena, s);
+			release_write(lock, 0);
+			return res;
+		}
+	}
+
+	/* Nothing in any of the available arenas.  Build a new one. */
+	data_size = size_to_arena_size(s);
+	arena_size = sizeof(struct arena) + data_size / 8;
+	arena_size = (arena_size + 7) & ~7ul;
+
+	/* The arena structure itself comes out of sbrk memory. */
+	arena = sbrk(arena_size);
+	memset(arena->free_bitmap, 0xff, data_size / 8);
+	arena->nr_free = data_size / s;
+	arena->size = s;
+
+	/* The data area is mmap()ed. */
+	arena->data = mmap(NULL, data_size, PROT_READ|PROT_WRITE,
+			   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+
+	for (i = 0; i < arena->nr_free; i++) {
+		struct arena **h;
+		h = arena->data + i * s;
+		*h = arena;
+	}
+
+	arena->next = as->head_arena;
+	as->head_arena = arena;
+	dbg("new arena %p\n", arena);
+	res = allocate_in_arena(arena, s);
+	release_write(lock, 0);
+	return res;
+}
+
+#define internal_malloc(s) _internal_malloc(__builtin_return_address(0), (s))
+
 void *
 malloc(size_t s)
 {
-	return _malloc(get_alloc_site(s), s);
+	return internal_malloc(s);
 }
 
 void *
 calloc(size_t n, size_t s)
 {
-	void *r = _malloc(get_alloc_site(n*s), n * s);
+	void *r = internal_malloc(n * s);
 	if (!r)
 		return r;
 	memset(r, 0, n * s);
 	return r;
 }
 
-static void
-free_aligned(void *x)
-{
-	struct aligned_header *ah = x;
-	ah--;
-	assert(ah->h.aligned);
-	free(ah->real_allocation);
-}
-
 void
 free(void *x)
 {
-	struct chunk_header *header, *prev_header, *next_header;
-	struct chunk_footer *footer, *prev_footer, *next_footer;
 	struct arena *a;
+	int idx;
 
+	dbg("free %p\n", x);
 	if (!x)
 		return;
 
-	header = x;
-	header--;
-	if (header->h.aligned) {
-		free_aligned(x);
-		return;
-	}
-	dbg("free %p\n", x);
+	x -= 8;
+	/* Handle memalign()-style aligned chunks */
+	if ( *(unsigned long *)x & 1)
+		x = (void *)(*(unsigned long *)x & ~1ul);
+
+	a = *(struct arena ** *)x;
+	assert(!((unsigned long)a & 1));
+
+	dbg("arena %p\n", a);
 
 	while (cmpxchg_uint(&lock, 0, 1) == 0)
 		relax();
 
-	a = header->arena;
-	header->h.free = 1;
-	dbg("header %p size %lx arena %p\n", header, header->h.size, header->arena);
-	footer = (struct chunk_footer *)((unsigned long)header + header->h.size) - 1;
-	dbg("footer %p\n", footer);
-	if ((unsigned long)header != (unsigned long)a->content) {
-		/* Try to merge backwards */
-		prev_footer = (struct chunk_footer *)header - 1;
-		dbg("prev footer %p\n", prev_footer);
-		if (prev_footer->h.free) {
-			prev_header = (struct chunk_header *)((unsigned long)(prev_footer + 1) - prev_footer->h.size);
-			assert(prev_header->h.size == prev_footer->h.size);
-			assert(prev_header->arena == a);
-			prev_header->h.size += header->h.size;
-			header = prev_header;
-			dbg("merge backwards to %p new size %lx\n",
-			    prev_header, prev_header->h.size);
-		}
-	}
-
-	next_header = (struct chunk_header *)(footer + 1);
-	dbg("next header %p %p %p\n", next_header, a->content, a->content + a->size);
-	if ((unsigned long)next_header != (unsigned long)a->content + a->size) {
-		/* Try to merge forwards */
-		assert(next_header->arena == a);
-		dbg("next header %p %lx\n", next_header, next_header->h.size);
-		if (next_header->h.free) {
-			next_footer = (struct chunk_footer *)((unsigned long)next_header + next_header->h.size) - 1;
-			assert(next_footer->h.size == next_header->h.size);
-			assert(next_footer->h.free == next_header->h.free);
-			header->h.size += next_header->h.size;
-			footer = next_footer;
-			dbg("merge forwards to %p new size %lx\n",
-			    next_header, header->h.size);
-		}
-	}
-
-	footer->h = header->h;
+	idx = (x - a->data) / a->size;
+	dbg("idx %d\n", idx);
+	assert( !(a->free_bitmap[idx /8] & (1 << (idx % 8))) );
+	a->free_bitmap[idx/8] |= 1 << (idx % 8);
+	a->nr_free++;
 
 	release_write(lock, 0);
 }
@@ -349,49 +276,50 @@ cfree(void *x)
 }
 
 static void *
-_memalign(struct allocation_site *as, size_t boundary, size_t size)
+_memalign(void *ra, size_t boundary, size_t size)
 {
 	void *real_alloc;
 	void *aligned_alloc;
-	struct aligned_header *ah;
+	unsigned long *ah;
 
-	if (boundary <= 16)
-		return _malloc(as, size);
-	real_alloc = _malloc(as, size + boundary + sizeof(*ah));
+	if (boundary <= 8)
+		return _malloc(ra, size);
+	real_alloc = _malloc(ra, size + boundary + sizeof(*ah));
 	aligned_alloc = real_alloc + sizeof(*ah);
 	aligned_alloc = (void *)((unsigned long)aligned_alloc + boundary -
 				 ((unsigned long)aligned_alloc % boundary));
 	ah = aligned_alloc;
-	ah--;
-	ah->h.aligned = 1;
-	ah->real_allocation = real_alloc;
+	ah[-1] = (unsigned long)real_alloc | 1;
 	return aligned_alloc;
 }
 
 void *
 memalign(size_t boundary, size_t size)
 {
-	return _memalign(get_alloc_site(size), boundary, size);
+	return _memalign(__builtin_return_address(0), boundary, size);
 }
 
 size_t
-malloc_usable_size(void *x)
+malloc_usable_size(const void *_x)
 {
-	struct chunk_header *h;
-	h = x;
-	h--;
-	return h->h.size - sizeof(*h) - sizeof(struct chunk_footer);
+	const unsigned long *x = _x;
+	struct arena *a;
+	if (x[-1] & 1) {
+		abort();
+#warning Write me
+	}
+	a = (struct arena *)x[-1];
+	return a->size - sizeof(struct arena *);
 }
 
 void *
 realloc(void *x, size_t s)
 {
-	struct allocation_site *as = get_alloc_site(s);
 	size_t old_size;
 	void *y;
 
 	if (!x)
-		return _malloc(as, s);
+		return internal_malloc(s);
 	if (!s) {
 		free(x);
 		return NULL;
@@ -399,7 +327,7 @@ realloc(void *x, size_t s)
 	old_size = malloc_usable_size(x);
 	if (old_size >= s)
 		return x;
-	y = _malloc(as, s);
+	y = internal_malloc(s);
 	memcpy(y, x, old_size);
 	free(x);
 	return y;
@@ -408,13 +336,13 @@ realloc(void *x, size_t s)
 void *
 valloc(size_t s)
 {
-	return _memalign(get_alloc_site(s), PAGE_SIZE, s);
+	return _memalign(__builtin_return_address(0), PAGE_SIZE, s);
 }
 
 void *
 pvalloc(size_t s)
 {
-	return _memalign(get_alloc_site(s), PAGE_SIZE, (s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
+	return _memalign(__builtin_return_address(0), PAGE_SIZE, (s + PAGE_SIZE) & ~(PAGE_SIZE - 1));
 }
 
 void *
@@ -431,7 +359,6 @@ malloc_set_state(void *x)
 void **
 independent_calloc(size_t n_elements, size_t element_size, void *chunks[])
 {
-	struct allocation_site *as = get_alloc_site(element_size);
 	int x;
 	void **res;
 	if (chunks)
@@ -439,7 +366,7 @@ independent_calloc(size_t n_elements, size_t element_size, void *chunks[])
 	else
 		res = malloc(sizeof(void *) * n_elements);
 	for (x = 0; x < n_elements; x++) {
-		res[x] = _malloc(as, element_size);
+		res[x] = internal_malloc(element_size);
 		memset(res[x], 0, element_size);
 	}
 	return res;
@@ -456,7 +383,7 @@ independent_comalloc(size_t n_elements, size_t sizes[], void *chunks[])
 	else
 		res = malloc(sizeof(void *) * n_elements);
 	for (x = 0; x < n_elements; x++)
-		res[x] = _malloc(get_alloc_site(sizes[x]), sizes[x]);
+		res[x] = internal_malloc(sizes[x]);
 	return res;
 }
 
