@@ -190,7 +190,7 @@ void dump_debug_ring(void);
 #define PRIO_STDOUT 0
 #define PRIO_STDERR 20
 #else
-#define PRIO_RING 0
+#define PRIO_RING 1
 #define PRIO_STDOUT 10
 #define PRIO_STDERR 20
 #endif

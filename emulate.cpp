@@ -34,6 +34,7 @@ struct augmented_regs {
 	unsigned long cc_dep1;
 	unsigned long cc_dep2;
 	unsigned long cc_ndep;
+	unsigned long dflag;
 };
 
 static int
@@ -70,6 +71,8 @@ libvex_offset_to_linux_offset(int offset)
 		return offsetof(struct augmented_regs, cc_dep2);
 	case 152:
 		return offsetof(struct augmented_regs, cc_ndep);
+	case 160:
+		return offsetof(struct augmented_regs, dflag);
 	default:
 		abort();
 	}
@@ -128,6 +131,8 @@ eval_expression(struct thread *thr,
 			break;
 		simple_op(Add, +)
 		simple_op(Sub, -)
+		simple_op(And, &)
+		simple_op(Or, |)
 		simple_op(Shl, <<)
 		simple_op(CmpEQ, ==)
 #undef simple_op
@@ -135,22 +140,27 @@ eval_expression(struct thread *thr,
 			abort();
 		}
 		typeOfPrimop(e->Iex.Binop.op, &t1, &t2, &t3, &t4, &t5);
-		switch (sizeofIRType(t1)) {
-		case 1:
+		if (t1 == Ity_I1) {
 			res.hi = 0;
-			res.lo &= 0xff;
-			break;
-		case 2:
-			res.hi = 0;
-			res.lo &= 0xffff;
-			break;
-		case 4:
-			res.hi = 0;
-			res.lo &= 0xffffffff;
-			break;
-		case 8:
-			res.hi = 0;
-			break;
+			res.lo &= 1;
+		} else {
+			switch (sizeofIRType(t1)) {
+			case 1:
+				res.hi = 0;
+				res.lo &= 0xff;
+				break;
+			case 2:
+				res.hi = 0;
+				res.lo &= 0xffff;
+				break;
+			case 4:
+				res.hi = 0;
+				res.lo &= 0xffffffff;
+				break;
+			case 8:
+				res.hi = 0;
+				break;
+			}
 		}
 		return res;
 	}
@@ -381,13 +391,42 @@ recalculate_eflags(struct augmented_regs *urs)
 			     AMD64G_CC_MASK_S |
 			     AMD64G_CC_MASK_Z |
 			     AMD64G_CC_MASK_C |
-			     AMD64G_CC_MASK_P);
+			     AMD64G_CC_MASK_P |
+			     1024);
 	urs->urs.eflags |=
 		(of << AMD64G_CC_SHIFT_O) |
 		(sf << AMD64G_CC_SHIFT_S) |
 		(zf << AMD64G_CC_SHIFT_Z) |
 		(cf << AMD64G_CC_SHIFT_C) |
 		(pf << AMD64G_CC_SHIFT_P);
+	if (urs->dflag != 1)
+		urs->urs.eflags |= 1024;
+}
+
+static void
+handle_cas(struct thread *thr,
+	   struct augmented_regs *urs,
+	   struct expression_result *tmps,
+	   IRCAS *details,
+	   int size)
+{
+	struct expression_result addr =
+		eval_expression(thr, urs, details->addr, tmps);
+	struct expression_result expd =
+		eval_expression(thr, urs, details->expdLo, tmps);
+	struct expression_result data =
+		eval_expression(thr, urs, details->dataLo, tmps);
+	struct expression_result old;
+
+	/* Hack: we rely on the fact that we're only here because of
+	   page protection, which is global to all threads, and so
+	   every other thread must come through here, and so we don't
+	   actually need to be atomic. */
+	memset(&old, 0, sizeof(old));
+	_fetch_bytes(thr, addr.lo, &old, size);
+	if (old.lo == expd.lo && old.hi == expd.hi)
+		handle_store(thr, addr, data, size);
+	tmps[details->oldLo] = old;
 }
 
 extern "C" void
@@ -408,6 +447,10 @@ emulate_instruction(struct thread *thr)
 	urs.cc_dep1 = urs.urs.eflags;
 	urs.cc_dep2 = 0;
 	urs.cc_ndep = 0;
+	if (urs.urs.eflags & 1024)
+		urs.dflag = -1;
+	else
+		urs.dflag = 1;
 
 	_fetch_bytes(thr, urs.urs.rip, buf, 16);
 	LibVEX_default_VexArchInfo(&vai);
@@ -451,6 +494,12 @@ emulate_instruction(struct thread *thr)
 				     sizeofIRExpr(irsb->tyenv,
 						  irsb->stmts[x]->Ist.Store.data));
 			break;
+		case Ist_CAS:
+			handle_cas(thr, &urs, tmps,
+				   irsb->stmts[x]->Ist.CAS.details,
+				   sizeofIRExpr(irsb->tyenv,
+						irsb->stmts[x]->Ist.CAS.details->expdLo));
+			break;
 		case Ist_Exit:
 			assert(irsb->stmts[x]->Ist.Exit.jk == Ijk_Boring);
 			if (eval_expression(thr, &urs,
@@ -470,7 +519,10 @@ emulate_instruction(struct thread *thr)
 
 	switch (dr.whatNext) {
 	case DisResult::Dis_StopHere:
-		abort();
+		urs.urs.rip = eval_expression(thr, &urs,
+					      irsb->next,
+					      tmps).lo;
+		break;
 	case DisResult::Dis_Continue:
 		urs.urs.rip += dr.len;
 		break;
