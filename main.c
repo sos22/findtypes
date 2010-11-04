@@ -30,6 +30,8 @@
 #define PRELOAD_LIB_NAME "/local/scratch/sos22/findtypes/ft.so"
 #define PTRACE_OPTIONS (PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEVFORK | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK)
 
+static struct allocation_site *currently_investigated;
+
 #define INTERVAL 1
 
 int
@@ -268,7 +270,8 @@ start_process(char *argv[])
 	head_thr = list_first(&child->threads, struct thread, list);
 
 	/* Child starts stopped. */
-	resume_child(head_thr);
+	ptrace(PTRACE_CONT, head_thr->pid, NULL, NULL);
+	head_thr->_stop_status = -1;
 
 	/* Get the break address */
 	r = read(child->from_child_fd, &child->malloc_hash,
@@ -481,7 +484,6 @@ static void
 change_investigated_type(struct process *p)
 {
 	static unsigned target_cntr;
-	static struct allocation_site *currently_investigated;
 	unsigned x;
 	struct allocation_site *ah;
 	unsigned cntr;
@@ -533,6 +535,36 @@ child_got_segv(struct thread *thr)
 	printf("Child %d got segv at %p, rip %lx\n",
 	       thr->pid, si.si_addr, regs.rip);
 	emulate_instruction(thr);
+	resume_child(thr);
+}
+
+static void
+child_syscall(struct process *proc, struct thread *thr)
+{
+	struct user_regs_struct urs;
+	if (!currently_investigated) {
+		resume_child(thr);
+		return;
+	}
+	get_regs(thr, &urs);
+	if (-urs.rax != EFAULT) {
+		resume_child(thr);
+		return;
+	}
+
+	/* This syscall touched the some bit of memory.  Unprotect and
+	   let it go. */
+	while (acquire_malloc_lock(proc) < 0)
+		warnx("struggling to acquire malloc lock for %d",
+		      thr->pid);
+	stop_investigating(proc, currently_investigated);
+	currently_investigated = NULL;
+	release_malloc_lock(proc);
+
+	/* Retry the syscall */
+	urs.rax = urs.orig_rax;
+	urs.rip -= 2;
+	set_regs(thr, &urs);
 	resume_child(thr);
 }
 
@@ -630,6 +662,8 @@ main(int argc, char *argv[])
 				resume_child(thr);
 			} else if (WSTOPSIG(thr_stop_status(thr)) == SIGSEGV) {
 				child_got_segv(thr);
+			} else if (WSTOPSIG(thr_stop_status(thr)) == (SIGTRAP | 0x80)) {
+				child_syscall(child, thr);
 			} else {
 				msg(20, "Sending signal %d to child %d\n",
 				    WSTOPSIG(thr_stop_status(thr)), thr->pid);

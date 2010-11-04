@@ -241,8 +241,8 @@ resume_child(struct thread *thr)
 {
 	if (!thr_is_stopped(thr))
 		return;
-	if (ptrace(PTRACE_CONT, thr->pid, NULL, NULL) < 0)
-		err(1, "ptrace(PTRACE_CONT) from resume_child()");
+	if (ptrace(PTRACE_SYSCALL, thr->pid, NULL, NULL) < 0)
+		err(1, "ptrace(PTRACE_SYSCALL) from resume_child()");
 	thr_resume(thr);
 }
 
