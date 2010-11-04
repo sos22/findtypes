@@ -378,21 +378,21 @@ remote_mprotect(struct process *p, unsigned long start, unsigned long size, unsi
 	int status;
 
 	get_regs(thr, &old_regs);
-	printf("rax %lx, orig_rax %lx\n", old_regs.rax, old_regs.orig_rax);
+	printf("rax %lx, orig_rax %lx status %x\n", old_regs.rax, old_regs.orig_rax,
+	       thr->_stop_status);
 
-	if (old_regs.orig_rax != ~0ul) {
+	if (thr->_stop_status == 0x857f) {
 		/* The thread is already in the middle of a
-		 * syscall.  */
-		if (-old_regs.rax == 516 ||
-		    -old_regs.rax == 514) {
-			/* Yurk.  The kernel won't automatically
-			   restart these types, and it confuses
-			   various programs (e.g. anything based on
-			   glib).  Do it manually. */
-			old_regs.rip -= 2;
-			old_regs.rax = old_regs.orig_rax;
-		}
+		 * syscall.  Get it out of it. */
+		printf("Get out of syscall\n");
+		if (ptrace(PTRACE_SYSCALL, thr->pid, NULL, NULL) < 0)
+			err(1, "ptrace_syscall3");
+		if (waitpid(thr->pid, &status, __WALL) < 0)
+			err(1, "waitpid to get out of syscall");
+		assert(status == 0x137f);
+		get_regs(thr, &old_regs);
 	}
+
 	new_regs = old_regs;
 	/* Hackety hackety hack: we assume that the vsyscall page
 	   includes a syscall instruction at a particular address. */
@@ -404,27 +404,18 @@ remote_mprotect(struct process *p, unsigned long start, unsigned long size, unsi
 	set_regs(thr, &new_regs);
 
 	/* Now step it through the syscall. */
-retry1:
-	if (ptrace(PTRACE_SYSCALL, thr->pid, NULL, NULL) < 0)
-		err(1, "PTRACE_SYSCALL1");
+	if (ptrace(PTRACE_SINGLESTEP, thr->pid, NULL, NULL) < 0)
+		err(1, "PTRACE_SINGLESTEP");
 	if (waitpid(thr->pid, &status, __WALL) < 0)
 		err(1, "waitpid for mprotect 1");
-	/* ptrace confuses the crap out of me.  Do what seems to be
-	   necessary to make it work. */
-	if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP)
-		goto retry1;
-
-	if (ptrace(PTRACE_SYSCALL, thr->pid, NULL, NULL) < 0)
-		err(1, "PTRACE_SYSCALL2");
-	if (waitpid(thr->pid, &status, __WALL) < 0)
-		err(1, "waitpid for mprotect 1");
+	assert(status == 0x57f);
 
 	/* Did it work? */
 	get_regs(thr, &new_regs);
 	if (new_regs.rax != 0) {
-		errno = new_regs.rax;
-		err(1, "remote_mprotect(%d, %lx, %lx, %lx)",
-		    thr->pid, start, size, prot);
+		errno = -new_regs.rax;
+		warn("remote_mprotect(%d, %lx, %lx, %lx)",
+		     thr->pid, start, size, prot);
 	}
 
 	/* Put it back to how it was */
